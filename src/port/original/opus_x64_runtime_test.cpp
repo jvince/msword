@@ -8,6 +8,13 @@
 
 extern "C" struct ITR vitr = {};
 
+// The product supplies this callback from Opus/rulerdrw.c.  This executable
+// deliberately tests the standalone runtime library, so keep its engine-side
+// dependency at the fixture boundary.
+extern "C" int OpusSaveDocumentAsDocx(int, const char*) {
+    return 0;
+}
+
 extern "C" void** mpdochdod[8] = {};
 extern "C" void** mpfnhfcb[8] = {};
 extern "C" void** mpwwhwwd[8] = {};

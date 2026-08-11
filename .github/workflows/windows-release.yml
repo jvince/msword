@@ -1,0 +1,43 @@
+name: Windows x64 build
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: src
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Configure x64 Release
+        run: cmake --preset x64-release
+
+      - name: Build x64 Release
+        run: cmake --build --preset x64-release
+
+      - name: Run stable tests
+        run: >-
+          ctest --test-dir ../out -C Release --output-on-failure
+          -R "^(opus_original_strtbl_test|opus_x64_runtime_test|opus_modern_formats_test|opus_original_sttb_test|opus_original_plc_test|opus_sdm_cab_test|opus_original_command_test|word1_port_smoke_test)$"
+
+      - name: Upload WORD1
+        uses: actions/upload-artifact@v7
+        with:
+          name: WORD1-x64-release
+          path: bin/WORD1.exe
+          if-no-files-found: error
+          retention-days: 30
