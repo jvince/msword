@@ -10,9 +10,11 @@
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cwctype>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -161,14 +163,25 @@ std::wstring ansi_to_wide(std::string_view value) {
 
 std::string xml_escape(std::wstring_view text) {
     std::string result;
-    for (const wchar_t character : text) {
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const wchar_t character = text[index];
         switch (character) {
             case L'&': result += "&amp;"; break;
             case L'<': result += "&lt;"; break;
             case L'>': result += "&gt;"; break;
             case L'\"': result += "&quot;"; break;
             case L'\'': result += "&apos;"; break;
-            default: result += wide_to_utf8(std::wstring_view(&character, 1));
+            default:
+                if (character >= 0xd800 && character <= 0xdbff &&
+                    index + 1 < text.size() && text[index + 1] >= 0xdc00 &&
+                    text[index + 1] <= 0xdfff) {
+                    result += wide_to_utf8(text.substr(index, 2));
+                    ++index;
+                } else if (!(character >= 0xd800 && character <= 0xdfff)) {
+                    result += wide_to_utf8(text.substr(index, 1));
+                } else {
+                    result += "&#xFFFD;";
+                }
         }
     }
     return result;
@@ -1389,6 +1402,832 @@ bool read_bytes(const std::wstring& path, std::string& bytes,
     return ok;
 }
 
+std::uint16_t zip_u16(std::string_view bytes, const std::size_t offset) {
+    if (offset > bytes.size() || bytes.size() - offset < 2)
+        throw std::runtime_error("truncated ZIP field");
+    return static_cast<std::uint16_t>(
+        static_cast<unsigned char>(bytes[offset]) |
+        (static_cast<unsigned char>(bytes[offset + 1]) << 8));
+}
+
+std::uint32_t zip_u32(std::string_view bytes, const std::size_t offset) {
+    if (offset > bytes.size() || bytes.size() - offset < 4)
+        throw std::runtime_error("truncated ZIP field");
+    return static_cast<std::uint32_t>(
+        static_cast<unsigned char>(bytes[offset]) |
+        (static_cast<unsigned char>(bytes[offset + 1]) << 8) |
+        (static_cast<unsigned char>(bytes[offset + 2]) << 16) |
+        (static_cast<unsigned char>(bytes[offset + 3]) << 24));
+}
+
+void zip_append_u16(std::string& bytes, const std::uint16_t value) {
+    bytes.push_back(static_cast<char>(value & 0xff));
+    bytes.push_back(static_cast<char>((value >> 8) & 0xff));
+}
+
+void zip_append_u32(std::string& bytes, const std::uint32_t value) {
+    bytes.push_back(static_cast<char>(value & 0xff));
+    bytes.push_back(static_cast<char>((value >> 8) & 0xff));
+    bytes.push_back(static_cast<char>((value >> 16) & 0xff));
+    bytes.push_back(static_cast<char>((value >> 24) & 0xff));
+}
+
+std::uint32_t zip_crc32(std::string_view bytes) {
+    std::uint32_t crc = 0xffffffffu;
+    for (const unsigned char byte : bytes) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xedb88320u &
+                  static_cast<std::uint32_t>(-
+                      static_cast<int>(crc & 1)));
+    }
+    return ~crc;
+}
+
+class DeflateBits {
+public:
+    explicit DeflateBits(std::string_view bytes) : bytes_(bytes) {}
+    bool read(const unsigned count, unsigned& value) {
+        if (count > 24) return false;
+        while (bits_ < count) {
+            if (position_ >= bytes_.size()) return false;
+            buffer_ |= static_cast<std::uint64_t>(
+                static_cast<unsigned char>(bytes_[position_++])) << bits_;
+            bits_ += 8;
+        }
+        value = static_cast<unsigned>(buffer_ & ((1ull << count) - 1));
+        buffer_ >>= count;
+        bits_ -= count;
+        return true;
+    }
+    bool align_byte() {
+        const unsigned discard = bits_ & 7u;
+        unsigned ignored = 0;
+        return discard == 0 || read(discard, ignored);
+    }
+    std::size_t byte_position() const { return position_ - bits_ / 8; }
+    bool set_byte_position(const std::size_t position) {
+        if (position > bytes_.size()) return false;
+        position_ = position;
+        buffer_ = 0;
+        bits_ = 0;
+        return true;
+    }
+    std::string_view bytes() const { return bytes_; }
+private:
+    std::string_view bytes_;
+    std::size_t position_ = 0;
+    std::uint64_t buffer_ = 0;
+    unsigned bits_ = 0;
+};
+
+struct DeflateHuffman {
+    std::array<unsigned, 16> counts{};
+    std::vector<unsigned short> symbols;
+
+    bool build(const std::vector<unsigned char>& lengths) {
+        counts.fill(0);
+        symbols.assign(lengths.size(), 0);
+        for (const unsigned length : lengths) {
+            if (length > 15) return false;
+            ++counts[length];
+        }
+        if (counts[0] == lengths.size()) return false;
+        int remaining = 1;
+        for (unsigned length = 1; length <= 15; ++length) {
+            remaining <<= 1;
+            remaining -= static_cast<int>(counts[length]);
+            if (remaining < 0) return false;
+        }
+        std::array<unsigned, 16> offsets{};
+        for (unsigned length = 1; length < 15; ++length)
+            offsets[length + 1] = offsets[length] + counts[length];
+        for (unsigned symbol = 0; symbol < lengths.size(); ++symbol)
+            if (lengths[symbol] != 0)
+                symbols[offsets[lengths[symbol]]++] =
+                    static_cast<unsigned short>(symbol);
+        return true;
+    }
+
+    bool decode(DeflateBits& bits, unsigned& symbol) const {
+        unsigned code = 0;
+        unsigned first = 0;
+        unsigned index = 0;
+        for (unsigned length = 1; length <= 15; ++length) {
+            unsigned bit = 0;
+            if (!bits.read(1, bit)) return false;
+            code |= bit;
+            const unsigned count = counts[length];
+            if (code >= first && code - first < count) {
+                const unsigned location = index + code - first;
+                if (location >= symbols.size()) return false;
+                symbol = symbols[location];
+                return true;
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        return false;
+    }
+};
+
+bool inflate_raw(std::string_view compressed, const std::size_t expected,
+                 std::string& output) {
+    static constexpr unsigned length_base[29] = {
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,
+        99,115,131,163,195,227,258};
+    static constexpr unsigned length_extra[29] = {
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static constexpr unsigned distance_base[30] = {
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+        1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static constexpr unsigned distance_extra[30] = {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,
+        12,12,13,13};
+    if (expected > kMaxGeneratedBytes) return false;
+    output.clear();
+    output.reserve(expected);
+    DeflateBits bits(compressed);
+    bool final_block = false;
+    while (!final_block) {
+        unsigned final = 0;
+        unsigned type = 0;
+        if (!bits.read(1, final) || !bits.read(2, type)) return false;
+        final_block = final != 0;
+        if (type == 0) {
+            if (!bits.align_byte()) return false;
+            const std::size_t position = bits.byte_position();
+            if (position > compressed.size() ||
+                compressed.size() - position < 4) return false;
+            const unsigned length = zip_u16(compressed, position);
+            const unsigned complement = zip_u16(compressed, position + 2);
+            if ((length ^ 0xffffu) != complement ||
+                compressed.size() - position - 4 < length ||
+                output.size() > expected || expected - output.size() < length)
+                return false;
+            output.append(compressed.substr(position + 4, length));
+            if (!bits.set_byte_position(position + 4 + length)) return false;
+            continue;
+        }
+        if (type == 3) return false;
+
+        std::vector<unsigned char> literal_lengths;
+        std::vector<unsigned char> distance_lengths;
+        if (type == 1) {
+            literal_lengths.assign(288, 0);
+            for (unsigned index = 0; index <= 143; ++index)
+                literal_lengths[index] = 8;
+            for (unsigned index = 144; index <= 255; ++index)
+                literal_lengths[index] = 9;
+            for (unsigned index = 256; index <= 279; ++index)
+                literal_lengths[index] = 7;
+            for (unsigned index = 280; index <= 287; ++index)
+                literal_lengths[index] = 8;
+            distance_lengths.assign(32, 5);
+        } else {
+            unsigned hlit = 0, hdist = 0, hclen = 0;
+            if (!bits.read(5, hlit) || !bits.read(5, hdist) ||
+                !bits.read(4, hclen)) return false;
+            hlit += 257;
+            hdist += 1;
+            hclen += 4;
+            if (hlit > 286 || hdist > 32) return false;
+            static constexpr unsigned order[19] = {
+                16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+            std::vector<unsigned char> code_lengths(19, 0);
+            for (unsigned index = 0; index < hclen; ++index) {
+                unsigned length = 0;
+                if (!bits.read(3, length)) return false;
+                code_lengths[order[index]] = static_cast<unsigned char>(length);
+            }
+            DeflateHuffman code_tree;
+            if (!code_tree.build(code_lengths)) return false;
+            std::vector<unsigned char> all_lengths;
+            all_lengths.reserve(hlit + hdist);
+            while (all_lengths.size() < hlit + hdist) {
+                unsigned symbol = 0;
+                if (!code_tree.decode(bits, symbol)) return false;
+                if (symbol <= 15) {
+                    all_lengths.push_back(static_cast<unsigned char>(symbol));
+                } else if (symbol == 16) {
+                    unsigned repeat = 0;
+                    if (all_lengths.empty() || !bits.read(2, repeat)) return false;
+                    repeat += 3;
+                    if (repeat > hlit + hdist - all_lengths.size()) return false;
+                    all_lengths.insert(all_lengths.end(), repeat,
+                                       all_lengths.back());
+                } else if (symbol == 17 || symbol == 18) {
+                    unsigned repeat = 0;
+                    const unsigned extra = symbol == 17 ? 3 : 7;
+                    if (!bits.read(extra, repeat)) return false;
+                    repeat += symbol == 17 ? 3 : 11;
+                    if (repeat > hlit + hdist - all_lengths.size()) return false;
+                    all_lengths.insert(all_lengths.end(), repeat, 0);
+                } else return false;
+            }
+            literal_lengths.assign(all_lengths.begin(),
+                                   all_lengths.begin() + hlit);
+            distance_lengths.assign(all_lengths.begin() + hlit,
+                                    all_lengths.end());
+        }
+        DeflateHuffman literal_tree;
+        DeflateHuffman distance_tree;
+        if (!literal_tree.build(literal_lengths) ||
+            !distance_tree.build(distance_lengths)) return false;
+        for (;;) {
+            unsigned symbol = 0;
+            if (!literal_tree.decode(bits, symbol)) return false;
+            if (symbol < 256) {
+                if (output.size() >= expected) return false;
+                output.push_back(static_cast<char>(symbol));
+                continue;
+            }
+            if (symbol == 256) break;
+            if (symbol < 257 || symbol > 285) return false;
+            const unsigned length_index = symbol - 257;
+            unsigned length_bits = 0;
+            if (!bits.read(length_extra[length_index], length_bits)) return false;
+            const unsigned length = length_base[length_index] + length_bits;
+            unsigned distance_symbol = 0;
+            if (!distance_tree.decode(bits, distance_symbol) ||
+                distance_symbol >= 30) return false;
+            unsigned distance_bits = 0;
+            if (!bits.read(distance_extra[distance_symbol], distance_bits))
+                return false;
+            const unsigned distance =
+                distance_base[distance_symbol] + distance_bits;
+            if (distance == 0 || distance > output.size() ||
+                output.size() > expected || expected - output.size() < length)
+                return false;
+            for (unsigned index = 0; index < length; ++index)
+                output.push_back(output[output.size() - distance]);
+        }
+    }
+    return output.size() == expected;
+}
+
+bool read_zip_entry(const std::wstring& path, std::string_view requested_name,
+                    std::string& data, const std::size_t maximum_size) {
+    std::string package;
+    if (!read_bytes(path, package, kMaxGeneratedBytes) ||
+        package.size() < 22 || requested_name.empty()) return false;
+    const std::size_t search_first = package.size() > 65557 ?
+        package.size() - 65557 : 0;
+    std::size_t eocd = std::string::npos;
+    for (std::size_t position = package.size() - 22;; --position) {
+        if (zip_u32(package, position) == 0x06054b50u) {
+            eocd = position;
+            break;
+        }
+        if (position == search_first) break;
+    }
+    if (eocd == std::string::npos || zip_u16(package, eocd + 4) != 0 ||
+        zip_u16(package, eocd + 6) != 0 ||
+        zip_u16(package, eocd + 8) != zip_u16(package, eocd + 10))
+        return false;
+    const unsigned entry_count = zip_u16(package, eocd + 10);
+    if (entry_count > 4096) return false;
+    const std::size_t central_size = zip_u32(package, eocd + 12);
+    const std::size_t central_offset = zip_u32(package, eocd + 16);
+    if (central_offset > package.size() ||
+        central_size > package.size() - central_offset ||
+        central_offset + central_size > eocd) return false;
+    std::size_t position = central_offset;
+    for (unsigned entry = 0; entry < entry_count; ++entry) {
+        if (position > package.size() || package.size() - position < 46 ||
+            zip_u32(package, position) != 0x02014b50u) return false;
+        const unsigned flags = zip_u16(package, position + 8);
+        const unsigned method = zip_u16(package, position + 10);
+        const std::uint32_t crc = zip_u32(package, position + 16);
+        const std::size_t compressed_size = zip_u32(package, position + 20);
+        const std::size_t uncompressed_size = zip_u32(package, position + 24);
+        const std::size_t name_length = zip_u16(package, position + 28);
+        const std::size_t extra_length = zip_u16(package, position + 30);
+        const std::size_t comment_length = zip_u16(package, position + 32);
+        const std::size_t local_offset = zip_u32(package, position + 42);
+        const std::size_t record_size = 46 + name_length + extra_length +
+                                        comment_length;
+        if (record_size > package.size() - position) return false;
+        const std::string_view name(package.data() + position + 46,
+                                    name_length);
+        if (name == requested_name) {
+            if ((flags & 1u) != 0 || (method != 0 && method != 8) ||
+                uncompressed_size > maximum_size ||
+                compressed_size > kMaxGeneratedBytes ||
+                local_offset > package.size() ||
+                package.size() - local_offset < 30 ||
+                zip_u32(package, local_offset) != 0x04034b50u)
+                return false;
+            const std::size_t local_name = zip_u16(package, local_offset + 26);
+            const std::size_t local_extra = zip_u16(package, local_offset + 28);
+            const std::size_t content_offset =
+                local_offset + 30 + local_name + local_extra;
+            if (content_offset > package.size() ||
+                compressed_size > package.size() - content_offset)
+                return false;
+            const std::string_view compressed(
+                package.data() + content_offset, compressed_size);
+            if (method == 0) {
+                if (compressed_size != uncompressed_size) return false;
+                data.assign(compressed);
+            } else if (!inflate_raw(compressed, uncompressed_size, data)) {
+                return false;
+            }
+            return zip_crc32(data) == crc;
+        }
+        position += record_size;
+    }
+    return false;
+}
+
+struct ZipWriteEntry {
+    std::string name;
+    std::string data;
+};
+
+bool write_stored_zip(const std::wstring& path,
+                      const std::vector<ZipWriteEntry>& entries) {
+    if (entries.empty() || entries.size() > 4096) return false;
+    std::string archive;
+    std::string central;
+    archive.reserve(4096);
+    for (const ZipWriteEntry& entry : entries) {
+        if (entry.name.empty() || entry.name.size() > 0xffff ||
+            entry.data.size() > 0xffffffffu ||
+            archive.size() > 0xffffffffu) return false;
+        const std::uint32_t offset = static_cast<std::uint32_t>(archive.size());
+        const std::uint32_t size = static_cast<std::uint32_t>(entry.data.size());
+        const std::uint32_t crc = zip_crc32(entry.data);
+        zip_append_u32(archive, 0x04034b50u);
+        zip_append_u16(archive, 20);
+        zip_append_u16(archive, 0x0800);
+        zip_append_u16(archive, 0);
+        zip_append_u16(archive, 0);
+        zip_append_u16(archive, 0);
+        zip_append_u32(archive, crc);
+        zip_append_u32(archive, size);
+        zip_append_u32(archive, size);
+        zip_append_u16(archive, static_cast<std::uint16_t>(entry.name.size()));
+        zip_append_u16(archive, 0);
+        archive += entry.name;
+        archive += entry.data;
+
+        zip_append_u32(central, 0x02014b50u);
+        zip_append_u16(central, 20);
+        zip_append_u16(central, 20);
+        zip_append_u16(central, 0x0800);
+        zip_append_u16(central, 0);
+        zip_append_u16(central, 0);
+        zip_append_u16(central, 0);
+        zip_append_u32(central, crc);
+        zip_append_u32(central, size);
+        zip_append_u32(central, size);
+        zip_append_u16(central, static_cast<std::uint16_t>(entry.name.size()));
+        zip_append_u16(central, 0);
+        zip_append_u16(central, 0);
+        zip_append_u16(central, 0);
+        zip_append_u16(central, 0);
+        zip_append_u32(central, 0);
+        zip_append_u32(central, offset);
+        central += entry.name;
+    }
+    if (archive.size() > 0xffffffffu || central.size() > 0xffffffffu ||
+        archive.size() + central.size() > kMaxGeneratedBytes) return false;
+    const std::uint32_t central_offset =
+        static_cast<std::uint32_t>(archive.size());
+    archive += central;
+    zip_append_u32(archive, 0x06054b50u);
+    zip_append_u16(archive, 0);
+    zip_append_u16(archive, 0);
+    zip_append_u16(archive, static_cast<std::uint16_t>(entries.size()));
+    zip_append_u16(archive, static_cast<std::uint16_t>(entries.size()));
+    zip_append_u32(archive, static_cast<std::uint32_t>(central.size()));
+    zip_append_u32(archive, central_offset);
+    zip_append_u16(archive, 0);
+    return archive.size() <= kMaxGeneratedBytes && write_bytes(path, archive);
+}
+
+struct LocalElement {
+    std::string_view opening;
+    std::string_view inner;
+    std::string_view block;
+    std::size_t next = 0;
+};
+
+bool next_local_element(std::string_view xml, std::string_view local_name,
+                        std::size_t start, LocalElement& result) {
+    while ((start = xml.find('<', start)) != std::string_view::npos) {
+        if (start + 1 >= xml.size()) return false;
+        const char kind = xml[start + 1];
+        const std::size_t open_end = xml.find('>', start + 1);
+        if (open_end == std::string_view::npos) return false;
+        const std::string_view opening =
+            xml.substr(start, open_end - start + 1);
+        if (kind == '/' || kind == '!' || kind == '?' ||
+            local_tag_name(opening) != local_name) {
+            start = open_end + 1;
+            continue;
+        }
+        if (open_end > start && xml[open_end - 1] == '/') {
+            result = {opening, {}, opening, open_end + 1};
+            return true;
+        }
+        std::size_t name_start = start + 1;
+        while (name_start < open_end && std::isspace(
+                   static_cast<unsigned char>(xml[name_start]))) ++name_start;
+        std::size_t name_end = name_start;
+        while (name_end < open_end && !std::isspace(
+                   static_cast<unsigned char>(xml[name_end])) &&
+               xml[name_end] != '/' && xml[name_end] != '>') ++name_end;
+        if (name_end == name_start) return false;
+        const std::string qualified(xml.substr(name_start,
+                                                name_end - name_start));
+        const std::string closing = "</" + qualified + ">";
+        const std::size_t close = xml.find(closing, open_end + 1);
+        if (close == std::string_view::npos) return false;
+        const std::size_t block_end = close + closing.size();
+        result.opening = opening;
+        result.inner = xml.substr(open_end + 1, close - open_end - 1);
+        result.block = xml.substr(start, block_end - start);
+        result.next = block_end;
+        return true;
+    }
+    return false;
+}
+
+std::string_view first_local_block(std::string_view xml,
+                                   std::string_view local_name) {
+    LocalElement element;
+    return next_local_element(xml, local_name, 0, element) ? element.block :
+        std::string_view{};
+}
+
+bool parse_odf_number(std::string_view source, double& result) {
+    if (source.empty() || source.size() > 64) return false;
+    const std::string value(source);
+    char* end = nullptr;
+    result = std::strtod(value.c_str(), &end);
+    return end != value.c_str() && std::isfinite(result) &&
+           static_cast<std::size_t>(end - value.c_str()) <= value.size();
+}
+
+bool parse_odf_length(std::string_view value, int& twips,
+                      const int minimum = -31680,
+                      const int maximum = 63360) {
+    double number = 0.0;
+    if (!parse_odf_number(value, number)) return false;
+    std::size_t suffix = 0;
+    while (suffix < value.size() &&
+           (std::isdigit(static_cast<unsigned char>(value[suffix])) ||
+            value[suffix] == '+' || value[suffix] == '-' ||
+            value[suffix] == '.' || value[suffix] == 'e' ||
+            value[suffix] == 'E')) ++suffix;
+    const std::string_view unit = value.substr(suffix);
+    double scale = 0.0;
+    if (unit == "in") scale = 1440.0;
+    else if (unit == "cm") scale = 1440.0 / 2.54;
+    else if (unit == "mm") scale = 1440.0 / 25.4;
+    else if (unit == "pt") scale = 20.0;
+    else if (unit == "pc") scale = 240.0;
+    else if (unit == "px") scale = 15.0;
+    else return false;
+    const double converted = number * scale;
+    if (!std::isfinite(converted) || converted < minimum ||
+        converted > maximum) return false;
+    twips = static_cast<int>(std::lround(converted));
+    return true;
+}
+
+bool odf_truth(std::string_view value) {
+    return value == "true" || value == "always" || value == "page" ||
+           value == "bold";
+}
+
+struct OdfStyleDefinition {
+    std::string family;
+    std::string parent;
+    std::string text_properties;
+    std::string paragraph_properties;
+};
+
+struct OdfStyleCatalog {
+    RunStyle default_run;
+    Paragraph default_paragraph;
+    DocumentSettings settings;
+    std::map<std::string, OdfStyleDefinition> definitions;
+};
+
+void apply_odf_text_properties(RunStyle& style, std::string_view properties) {
+    LocalElement element;
+    if (!next_local_element(properties, "text-properties", 0, element)) return;
+    const std::string_view tag = element.opening;
+    const std::string weight = tag_attribute(tag, "font-weight");
+    if (!weight.empty()) {
+        int numeric = 0;
+        style.bold = weight == "bold" ||
+            (parse_bounded_int(weight, 1, 1000, numeric) && numeric >= 600);
+    }
+    const std::string italic = tag_attribute(tag, "font-style");
+    if (!italic.empty()) style.italic = italic != "normal" && italic != "none";
+    const std::string underline = tag_attribute(tag, "text-underline-style");
+    if (!underline.empty()) style.underline = underline != "none";
+    const std::string strike = tag_attribute(tag, "text-line-through-style");
+    if (!strike.empty()) style.strike = strike != "none";
+    const std::string variant = tag_attribute(tag, "font-variant");
+    if (!variant.empty()) style.small_caps = variant == "small-caps";
+    const std::string transform = tag_attribute(tag, "text-transform");
+    if (!transform.empty()) style.all_caps = transform == "uppercase";
+    const std::string display = tag_attribute(tag, "text-display");
+    if (!display.empty()) style.hidden = display == "none";
+    const std::string size = tag_attribute(tag, "font-size");
+    int size_twips = 0;
+    if (parse_odf_length(size, size_twips, 20, 2540))
+        style.half_points = (std::clamp)(size_twips / 10, 2, 254);
+    std::string font = tag_attribute(tag, "font-family");
+    if (font.empty()) font = tag_attribute(tag, "font-name");
+    if (font.size() >= 2 && ((font.front() == '\'' && font.back() == '\'') ||
+                            (font.front() == '"' && font.back() == '"')))
+        font = font.substr(1, font.size() - 2);
+    if (!font.empty()) style.font = xml_unescape(font);
+    const std::string color = tag_attribute(tag, "color");
+    if (color.size() == 7 && color.front() == '#') {
+        unsigned rgb = 0;
+        if (parse_rgb(std::string_view(color).substr(1), rgb)) {
+            style.color = RGB((rgb >> 16) & 0xff, (rgb >> 8) & 0xff,
+                              rgb & 0xff);
+            style.auto_color = false;
+        }
+    } else if (color == "auto") {
+        style.auto_color = true;
+        style.color = RGB(0, 0, 0);
+    }
+    std::string language = tag_attribute(tag, "language");
+    const std::string country = tag_attribute(tag, "country");
+    if (!language.empty() && language != "none") {
+        if (!country.empty() && country != "none") language += "-" + country;
+        const LanguageProfile& profile = profile_for_tag(language);
+        style.language = language;
+        style.code_page = profile.code_page;
+        style.charset = profile.charset;
+    }
+}
+
+void apply_odf_paragraph_properties(Paragraph& paragraph,
+                                    std::string_view properties) {
+    LocalElement element;
+    if (!next_local_element(properties, "paragraph-properties", 0, element))
+        return;
+    const std::string_view tag = element.opening;
+    const std::string alignment = tag_attribute(tag, "text-align");
+    if (!alignment.empty()) {
+        if (alignment == "center") paragraph.alignment = PFA_CENTER;
+        else if (alignment == "right" || alignment == "end")
+            paragraph.alignment = PFA_RIGHT;
+        else if (alignment == "justify") paragraph.alignment = PFA_JUSTIFY;
+        else paragraph.alignment = PFA_LEFT;
+    }
+    const std::string common_margin = tag_attribute(tag, "margin");
+    if (!common_margin.empty()) {
+        parse_odf_length(common_margin, paragraph.left_indent);
+        paragraph.right_indent = paragraph.left_indent;
+    }
+    parse_odf_length(tag_attribute(tag, "margin-left"),
+                     paragraph.left_indent);
+    parse_odf_length(tag_attribute(tag, "margin-right"),
+                     paragraph.right_indent);
+    parse_odf_length(tag_attribute(tag, "text-indent"),
+                     paragraph.first_line_indent);
+    parse_odf_length(tag_attribute(tag, "margin-top"), paragraph.space_before,
+                     0, 31680);
+    parse_odf_length(tag_attribute(tag, "margin-bottom"), paragraph.space_after,
+                     0, 31680);
+    const std::string line_height = tag_attribute(tag, "line-height");
+    if (!line_height.empty() && line_height.back() == '%') {
+        double percent = 0.0;
+        if (parse_odf_number(
+                std::string_view(line_height).substr(0, line_height.size() - 1),
+                percent) && percent >= 10.0 && percent <= 1000.0)
+            paragraph.line_spacing = static_cast<int>(std::lround(240.0 *
+                                                                  percent / 100.0));
+    } else {
+        parse_odf_length(line_height, paragraph.line_spacing, 0, 31680);
+    }
+    const std::string keep = tag_attribute(tag, "keep-together");
+    if (!keep.empty()) paragraph.keep_together = keep != "auto" && keep != "false";
+    const std::string keep_next = tag_attribute(tag, "keep-with-next");
+    if (!keep_next.empty())
+        paragraph.keep_with_next = keep_next != "auto" && keep_next != "false";
+    const std::string break_before = tag_attribute(tag, "break-before");
+    if (!break_before.empty()) paragraph.page_break_before = break_before == "page";
+    const std::string border = tag_attribute(tag, "border-bottom");
+    if (!border.empty()) paragraph.bottom_border = border != "none";
+}
+
+void parse_odf_styles_into(std::string_view xml, OdfStyleCatalog& catalog) {
+    std::size_t position = 0;
+    LocalElement element;
+    while (next_local_element(xml, "default-style", position, element)) {
+        const std::string family = tag_attribute(element.opening, "family");
+        if (family == "text" || family == "paragraph")
+            apply_odf_text_properties(catalog.default_run, element.block);
+        if (family == "paragraph")
+            apply_odf_paragraph_properties(catalog.default_paragraph,
+                                           element.block);
+        position = element.next;
+    }
+    position = 0;
+    while (next_local_element(xml, "style", position, element)) {
+        const std::string name = tag_attribute(element.opening, "name");
+        const std::string family = tag_attribute(element.opening, "family");
+        if (!name.empty() && (family == "text" || family == "paragraph")) {
+            require_parse_limit(catalog.definitions.size() < kMaxStyles);
+            OdfStyleDefinition definition;
+            definition.family = family;
+            definition.parent = tag_attribute(element.opening,
+                                               "parent-style-name");
+            if (const std::string_view props =
+                    first_local_block(element.inner, "text-properties");
+                !props.empty()) definition.text_properties.assign(props);
+            if (const std::string_view props =
+                    first_local_block(element.inner, "paragraph-properties");
+                !props.empty()) definition.paragraph_properties.assign(props);
+            catalog.definitions[name] = std::move(definition);
+        }
+        position = element.next;
+    }
+    position = 0;
+    while (next_local_element(xml, "page-layout", position, element)) {
+        LocalElement properties;
+        if (next_local_element(element.inner, "page-layout-properties", 0,
+                               properties)) {
+            DocumentSettings settings;
+            parse_odf_length(tag_attribute(properties.opening, "page-width"),
+                             settings.page_width, 720, 63360);
+            parse_odf_length(tag_attribute(properties.opening, "page-height"),
+                             settings.page_height, 720, 63360);
+            const std::string common = tag_attribute(properties.opening,
+                                                     "margin");
+            if (!common.empty()) {
+                parse_odf_length(common, settings.margin_left, 0, 31680);
+                settings.margin_right = settings.margin_top =
+                    settings.margin_bottom = settings.margin_left;
+            }
+            parse_odf_length(tag_attribute(properties.opening, "margin-left"),
+                             settings.margin_left, 0, 31680);
+            parse_odf_length(tag_attribute(properties.opening, "margin-right"),
+                             settings.margin_right, 0, 31680);
+            parse_odf_length(tag_attribute(properties.opening, "margin-top"),
+                             settings.margin_top, 0, 31680);
+            parse_odf_length(tag_attribute(properties.opening, "margin-bottom"),
+                             settings.margin_bottom, 0, 31680);
+            settings.valid = settings.page_width > 0 && settings.page_height > 0 &&
+                settings.margin_left + settings.margin_right < settings.page_width &&
+                settings.margin_top + settings.margin_bottom < settings.page_height;
+            if (settings.valid) catalog.settings = settings;
+        }
+        position = element.next;
+    }
+}
+
+void apply_odf_style(const OdfStyleCatalog& catalog, const std::string& name,
+                     RunStyle& run, Paragraph& paragraph,
+                     const int depth = 0) {
+    if (name.empty() || depth > 16) return;
+    const auto found = catalog.definitions.find(name);
+    if (found == catalog.definitions.end()) return;
+    if (!found->second.parent.empty() && found->second.parent != name)
+        apply_odf_style(catalog, found->second.parent, run, paragraph,
+                        depth + 1);
+    apply_odf_text_properties(run, found->second.text_properties);
+    apply_odf_paragraph_properties(paragraph,
+                                   found->second.paragraph_properties);
+}
+
+void append_odf_run(Paragraph& paragraph, const RunStyle& style,
+                    std::wstring text, std::size_t& total_runs,
+                    std::size_t& total_text) {
+    if (text.empty()) return;
+    require_parse_limit(text.size() <= kMaxTextBytes - total_text);
+    total_text += text.size();
+    if (!paragraph.runs.empty() && paragraph.runs.back().style == style) {
+        paragraph.runs.back().text += text;
+        return;
+    }
+    require_parse_limit(total_runs < kMaxRuns);
+    paragraph.runs.push_back({style, std::move(text)});
+    ++total_runs;
+}
+
+Paragraph parse_odf_paragraph(const LocalElement& element,
+                              const OdfStyleCatalog& catalog,
+                              std::size_t& total_runs,
+                              std::size_t& total_text) {
+    Paragraph paragraph = catalog.default_paragraph;
+    RunStyle base = catalog.default_run;
+    apply_odf_style(catalog, tag_attribute(element.opening, "style-name"),
+                    base, paragraph);
+    std::vector<RunStyle> styles{base};
+    std::size_t position = 0;
+    while (position < element.inner.size()) {
+        const std::size_t tag_start = element.inner.find('<', position);
+        const std::size_t text_end = tag_start == std::string_view::npos ?
+            element.inner.size() : tag_start;
+        if (text_end > position)
+            append_odf_run(paragraph, styles.back(),
+                           xml_unescape(element.inner.substr(position,
+                                                             text_end - position)),
+                           total_runs, total_text);
+        if (tag_start == std::string_view::npos) break;
+        const std::size_t tag_end = element.inner.find('>', tag_start + 1);
+        if (tag_end == std::string_view::npos) break;
+        const std::string_view tag = element.inner.substr(
+            tag_start, tag_end - tag_start + 1);
+        const std::string name = local_tag_name(tag);
+        const bool closing = tag.size() > 1 && tag[1] == '/';
+        const bool self_closing = tag.size() > 2 && tag[tag.size() - 2] == '/';
+        if (name == "span") {
+            if (closing) {
+                if (styles.size() > 1) styles.pop_back();
+            } else {
+                RunStyle style = styles.back();
+                Paragraph ignored;
+                apply_odf_style(catalog, tag_attribute(tag, "style-name"),
+                                style, ignored);
+                styles.push_back(std::move(style));
+                if (self_closing) styles.pop_back();
+            }
+        } else if (!closing && name == "s") {
+            int count = 1;
+            const std::string count_text = tag_attribute(tag, "c");
+            if (!count_text.empty()) parse_bounded_int(count_text, 1, 100000,
+                                                       count);
+            append_odf_run(paragraph, styles.back(),
+                           std::wstring(static_cast<std::size_t>(count), L' '),
+                           total_runs, total_text);
+        } else if (!closing && name == "tab") {
+            append_odf_run(paragraph, styles.back(), L"\t", total_runs,
+                           total_text);
+        } else if (!closing && name == "line-break") {
+            append_odf_run(paragraph, styles.back(), L"\n", total_runs,
+                           total_text);
+        } else if (!closing && name == "soft-page-break") {
+            append_odf_run(paragraph, styles.back(), L"\f", total_runs,
+                           total_text);
+        }
+        position = tag_end + 1;
+    }
+    return paragraph;
+}
+
+bool load_odt_paragraphs(const char* path,
+                         std::vector<Paragraph>& paragraphs,
+                         DocumentSettings* settings = nullptr,
+                         std::vector<TableLayout>* tables = nullptr) {
+    const std::wstring document_path = wide_path(path);
+    std::string mimetype;
+    std::string content;
+    std::string styles;
+    if (document_path.empty() ||
+        !read_zip_entry(document_path, "mimetype", mimetype, 256) ||
+        mimetype != "application/vnd.oasis.opendocument.text" ||
+        !read_zip_entry(document_path, "content.xml", content,
+                        kMaxDocumentXmlBytes)) return false;
+    read_zip_entry(document_path, "styles.xml", styles, kMaxStylesXmlBytes);
+    OdfStyleCatalog catalog;
+    parse_odf_styles_into(styles, catalog);
+    parse_odf_styles_into(content, catalog);
+    LocalElement office_text;
+    const std::string_view body = next_local_element(content, "text", 0,
+                                                      office_text) ?
+        office_text.inner : std::string_view(content);
+    paragraphs.clear();
+    if (tables != nullptr) tables->clear();
+    std::size_t position = 0;
+    std::size_t total_runs = 0;
+    std::size_t total_text = 0;
+    while (position < body.size()) {
+        LocalElement paragraph_element;
+        LocalElement heading_element;
+        const bool has_paragraph = next_local_element(body, "p", position,
+                                                       paragraph_element);
+        const bool has_heading = next_local_element(body, "h", position,
+                                                     heading_element);
+        if (!has_paragraph && !has_heading) break;
+        const LocalElement& chosen = !has_heading ||
+            (has_paragraph && paragraph_element.block.data() <
+                                heading_element.block.data()) ?
+            paragraph_element : heading_element;
+        require_parse_limit(paragraphs.size() < kMaxParagraphs);
+        paragraphs.push_back(parse_odf_paragraph(chosen, catalog, total_runs,
+                                                  total_text));
+        position = chosen.next;
+    }
+    if (paragraphs.empty()) paragraphs.push_back({});
+    if (settings != nullptr) *settings = catalog.settings;
+    return true;
+}
+
 struct StreamCookie { const char* data; LONG length; LONG position; };
 DWORD CALLBACK rich_edit_stream_in(DWORD_PTR cookie, LPBYTE buffer,
                                    LONG requested, LONG* copied) {
@@ -1743,6 +2582,220 @@ bool rtf_to_docx(const std::wstring& rtf_path, const std::wstring& docx_path) {
     RichEditDocument rich;
     return read_bytes(rtf_path, rtf) && rich.load(rtf) &&
            write_docx(docx_path, paragraphs_from_rich_edit(rich));
+}
+
+std::string odf_length(const int twips) {
+    char buffer[48]{};
+    std::snprintf(buffer, std::size(buffer), "%.4fin",
+                  static_cast<double>(twips) / 1440.0);
+    return buffer;
+}
+
+std::string odf_color(const COLORREF color) {
+    char buffer[8]{};
+    std::snprintf(buffer, std::size(buffer), "#%02X%02X%02X",
+                  GetRValue(color), GetGValue(color), GetBValue(color));
+    return buffer;
+}
+
+std::string odf_language_attributes(std::string_view language) {
+    if (language.empty()) return {};
+    const std::size_t dash = language.find('-');
+    std::string result = " fo:language=\"" +
+        std::string(language.substr(0, dash)) + "\"";
+    if (dash != std::string_view::npos && dash + 1 < language.size())
+        result += " fo:country=\"" + std::string(language.substr(dash + 1)) +
+                  "\"";
+    return result;
+}
+
+std::string odf_text_markup(std::wstring_view text) {
+    std::string xml;
+    std::wstring ordinary;
+    const auto flush = [&]() {
+        if (!ordinary.empty()) {
+            xml += xml_escape(ordinary);
+            ordinary.clear();
+        }
+    };
+    std::size_t index = 0;
+    while (index < text.size()) {
+        const wchar_t character = text[index++];
+        if (character == L' ' || character == L'\t' || character == L'\n' ||
+            character == L'\r' || character == L'\f') {
+            flush();
+            if (character == L' ') {
+                std::size_t count = 1;
+                while (index < text.size() && text[index] == L' ') {
+                    ++count;
+                    ++index;
+                }
+                xml += count == 1 ? "<text:s/>" :
+                    "<text:s text:c=\"" + std::to_string(count) + "\"/>";
+            } else if (character == L'\t') xml += "<text:tab/>";
+            else if (character == L'\f') xml += "<text:soft-page-break/>";
+            else if (character == L'\n') xml += "<text:line-break/>";
+        } else {
+            ordinary.push_back(character);
+        }
+    }
+    flush();
+    return xml;
+}
+
+std::string odf_paragraph_style(const Paragraph& paragraph,
+                                const std::size_t index) {
+    std::string xml = "<style:style style:name=\"P" +
+        std::to_string(index) + "\" style:family=\"paragraph\">";
+    xml += "<style:paragraph-properties";
+    if (paragraph.alignment != PFA_LEFT) {
+        const char* alignment = paragraph.alignment == PFA_CENTER ? "center" :
+            paragraph.alignment == PFA_RIGHT ? "right" : "justify";
+        xml += std::string(" fo:text-align=\"") + alignment + "\"";
+    }
+    if (paragraph.left_indent != 0)
+        xml += " fo:margin-left=\"" + odf_length(paragraph.left_indent) + "\"";
+    if (paragraph.right_indent != 0)
+        xml += " fo:margin-right=\"" + odf_length(paragraph.right_indent) + "\"";
+    if (paragraph.first_line_indent != 0)
+        xml += " fo:text-indent=\"" +
+               odf_length(paragraph.first_line_indent) + "\"";
+    if (paragraph.space_before != 0)
+        xml += " fo:margin-top=\"" + odf_length(paragraph.space_before) + "\"";
+    if (paragraph.space_after != 0)
+        xml += " fo:margin-bottom=\"" + odf_length(paragraph.space_after) + "\"";
+    if (paragraph.line_spacing != 0)
+        xml += " fo:line-height=\"" + odf_length(paragraph.line_spacing) + "\"";
+    if (paragraph.keep_together) xml += " fo:keep-together=\"always\"";
+    if (paragraph.keep_with_next) xml += " fo:keep-with-next=\"always\"";
+    if (paragraph.page_break_before) xml += " fo:break-before=\"page\"";
+    if (paragraph.bottom_border)
+        xml += " fo:border-bottom=\"0.5pt solid #000000\"";
+    xml += "/></style:style>";
+    return xml;
+}
+
+std::string odf_run_style(const RunStyle& style, const std::size_t index) {
+    std::string xml = "<style:style style:name=\"T" +
+        std::to_string(index) + "\" style:family=\"text\">";
+    xml += "<style:text-properties style:font-name=\"" +
+           xml_escape(style.font) + "\" fo:font-family=\"" +
+           xml_escape(style.font) + "\" fo:font-size=\"" +
+           std::to_string((std::max)(2, style.half_points) / 2.0) + "pt\"";
+    if (style.bold) xml += " fo:font-weight=\"bold\"";
+    if (style.italic) xml += " fo:font-style=\"italic\"";
+    if (style.underline)
+        xml += " style:text-underline-style=\"solid\"";
+    if (style.strike)
+        xml += " style:text-line-through-style=\"solid\"";
+    if (style.small_caps) xml += " fo:font-variant=\"small-caps\"";
+    if (style.all_caps) xml += " fo:text-transform=\"uppercase\"";
+    if (style.hidden) xml += " text:display=\"none\"";
+    if (!style.auto_color) xml += " fo:color=\"" + odf_color(style.color) + "\"";
+    xml += odf_language_attributes(style.language);
+    xml += "/></style:style>";
+    return xml;
+}
+
+std::string odf_content_xml(const std::vector<Paragraph>& paragraphs) {
+    std::string styles;
+    std::string body;
+    std::size_t run_index = 0;
+    for (std::size_t paragraph_index = 0;
+         paragraph_index < paragraphs.size(); ++paragraph_index) {
+        const Paragraph& paragraph = paragraphs[paragraph_index];
+        styles += odf_paragraph_style(paragraph, paragraph_index);
+        body += "<text:p text:style-name=\"P" +
+                std::to_string(paragraph_index) + "\">";
+        for (const TextRun& run : paragraph.runs) {
+            styles += odf_run_style(run.style, run_index);
+            body += "<text:span text:style-name=\"T" +
+                    std::to_string(run_index++) + "\">" +
+                    odf_text_markup(run.text) + "</text:span>";
+        }
+        body += "</text:p>";
+    }
+    return
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<office:document-content office:version=\"1.3\" "
+        "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+        "xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" "
+        "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" "
+        "xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\">"
+        "<office:automatic-styles>" + styles +
+        "</office:automatic-styles><office:body><office:text>" + body +
+        "</office:text></office:body></office:document-content>";
+}
+
+std::string odf_styles_xml(const DocumentSettings& source) {
+    const int page_width = source.valid ? source.page_width : 12240;
+    const int page_height = source.valid ? source.page_height : 15840;
+    const int margin_left = source.valid ? source.margin_left : 1440;
+    const int margin_right = source.valid ? source.margin_right : 1440;
+    const int margin_top = source.valid ? source.margin_top : 1440;
+    const int margin_bottom = source.valid ? source.margin_bottom : 1440;
+    return
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<office:document-styles office:version=\"1.3\" "
+        "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+        "xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" "
+        "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" "
+        "xmlns:fo=\"urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0\">"
+        "<office:styles><style:default-style style:family=\"paragraph\">"
+        "<style:text-properties style:font-name=\"Arial\" "
+        "fo:font-family=\"Arial\" fo:font-size=\"10pt\"/>"
+        "</style:default-style></office:styles><office:automatic-styles>"
+        "<style:page-layout style:name=\"pm1\"><style:page-layout-properties "
+        "fo:page-width=\"" + odf_length(page_width) +
+        "\" fo:page-height=\"" + odf_length(page_height) +
+        "\" fo:margin-left=\"" + odf_length(margin_left) +
+        "\" fo:margin-right=\"" + odf_length(margin_right) +
+        "\" fo:margin-top=\"" + odf_length(margin_top) +
+        "\" fo:margin-bottom=\"" + odf_length(margin_bottom) +
+        "\"/></style:page-layout></office:automatic-styles>"
+        "<office:master-styles><style:master-page style:name=\"Standard\" "
+        "style:page-layout-name=\"pm1\"/></office:master-styles>"
+        "</office:document-styles>";
+}
+
+bool write_odt(const std::wstring& path,
+               const std::vector<Paragraph>& paragraphs,
+               const DocumentSettings& settings = {}) {
+    static constexpr const char* mime =
+        "application/vnd.oasis.opendocument.text";
+    const std::string manifest =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<manifest:manifest manifest:version=\"1.3\" "
+        "xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\">"
+        "<manifest:file-entry manifest:full-path=\"/\" "
+        "manifest:media-type=\"application/vnd.oasis.opendocument.text\"/>"
+        "<manifest:file-entry manifest:full-path=\"content.xml\" "
+        "manifest:media-type=\"text/xml\"/>"
+        "<manifest:file-entry manifest:full-path=\"styles.xml\" "
+        "manifest:media-type=\"text/xml\"/>"
+        "<manifest:file-entry manifest:full-path=\"meta.xml\" "
+        "manifest:media-type=\"text/xml\"/>"
+        "</manifest:manifest>";
+    const std::string meta =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<office:document-meta office:version=\"1.3\" "
+        "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+        "xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\">"
+        "<office:meta><meta:generator>Microsoft Word 1.1</meta:generator>"
+        "</office:meta></office:document-meta>";
+    return write_stored_zip(path, {
+        {"mimetype", mime},
+        {"content.xml", odf_content_xml(paragraphs)},
+        {"styles.xml", odf_styles_xml(settings)},
+        {"meta.xml", meta},
+        {"META-INF/manifest.xml", manifest}});
+}
+
+bool rtf_to_odt(const std::wstring& rtf_path, const std::wstring& odt_path) {
+    std::string rtf;
+    RichEditDocument rich;
+    return read_bytes(rtf_path, rtf) && rich.load(rtf) &&
+           write_odt(odt_path, paragraphs_from_rich_edit(rich));
 }
 
 struct PdfLineRun {
@@ -2356,6 +3409,10 @@ extern "C" int OpusModernPathIsDocx(const char* path) {
     return path != nullptr && has_extension(path, ".docx");
 }
 
+extern "C" int OpusModernPathIsOdt(const char* path) {
+    return path != nullptr && has_extension(path, ".odt");
+}
+
 extern "C" int OpusModernDocxToRtfFile(const char* docx_path,
                                          const char* rtf_path) try {
     std::vector<Paragraph> paragraphs;
@@ -2371,6 +3428,37 @@ extern "C" int OpusModernDocxToTextFile(const char* docx_path,
     std::vector<TableLayout> tables;
     DocumentSettings settings;
     if (!load_docx_paragraphs(docx_path, paragraphs, &settings, &tables)) {
+        pending_docx_import = {};
+        return false;
+    }
+    const std::string text = paragraphs_to_text(paragraphs,
+                                                &pending_docx_import, &tables);
+    pending_docx_import.settings = settings;
+    if (!write_bytes(wide_path(text_path), text)) {
+        pending_docx_import = {};
+        return false;
+    }
+    return true;
+} catch (...) {
+    pending_docx_import = {};
+    return false;
+}
+
+extern "C" int OpusModernOdtToRtfFile(const char* odt_path,
+                                       const char* rtf_path) try {
+    std::vector<Paragraph> paragraphs;
+    return load_odt_paragraphs(odt_path, paragraphs) &&
+           write_bytes(wide_path(rtf_path), paragraphs_to_rtf(paragraphs));
+} catch (...) {
+    return false;
+}
+
+extern "C" int OpusModernOdtToTextFile(const char* odt_path,
+                                        const char* text_path) try {
+    std::vector<Paragraph> paragraphs;
+    std::vector<TableLayout> tables;
+    DocumentSettings settings;
+    if (!load_odt_paragraphs(odt_path, paragraphs, &settings, &tables)) {
         pending_docx_import = {};
         return false;
     }
@@ -3055,9 +4143,11 @@ extern "C" int OpusPdfSnapshotExportDialog(HWND owner) try {
 extern "C" int OpusDocxSnapshotExportPath(const char* path) try {
     if (path == nullptr || *path == '\0' ||
         pending_pdf_export.paragraphs.empty()) return false;
-    const bool written = write_docx(
-        wide_path(path), pending_pdf_export.paragraphs,
-        pending_pdf_export.settings);
+    const bool written = has_extension(path, ".odt") ?
+        write_odt(wide_path(path), pending_pdf_export.paragraphs,
+                  pending_pdf_export.settings) :
+        write_docx(wide_path(path), pending_pdf_export.paragraphs,
+                   pending_pdf_export.settings);
     pending_pdf_export = {};
     return written;
 } catch (...) {
@@ -3068,6 +4158,13 @@ extern "C" int OpusDocxSnapshotExportPath(const char* path) try {
 extern "C" int OpusModernRtfFileToDocx(const char* rtf_path,
                                         const char* docx_path) try {
     return rtf_to_docx(wide_path(rtf_path), wide_path(docx_path));
+} catch (...) {
+    return false;
+}
+
+extern "C" int OpusModernRtfFileToOdt(const char* rtf_path,
+                                       const char* odt_path) try {
+    return rtf_to_odt(wide_path(rtf_path), wide_path(odt_path));
 } catch (...) {
     return false;
 }

@@ -10,6 +10,10 @@
 extern "C" int OpusModernDocxToRtfFile(const char*, const char*);
 extern "C" int OpusModernDocxToTextFile(const char*, const char*);
 extern "C" int OpusModernRtfFileToDocx(const char*, const char*);
+extern "C" int OpusModernOdtToRtfFile(const char*, const char*);
+extern "C" int OpusModernOdtToTextFile(const char*, const char*);
+extern "C" int OpusModernRtfFileToOdt(const char*, const char*);
+extern "C" int OpusModernPathIsOdt(const char*);
 extern "C" int OpusModernRtfFileToPdf(const char*, const char*);
 extern "C" int OpusModernBindPendingDocxUnicode(int);
 extern "C" unsigned int OpusUnicodeScalarAt(int, long);
@@ -24,18 +28,44 @@ std::string read_file(const std::string& path) {
     return {std::istreambuf_iterator<char>(input), {}};
 }
 
+std::string decode_base64(const char* encoded) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    unsigned accumulator = 0;
+    int bits = 0;
+    for (const unsigned char character : std::string(encoded)) {
+        if (character == '=') break;
+        const char* found = std::strchr(alphabet, character);
+        if (found == nullptr) continue;
+        accumulator = (accumulator << 6) |
+            static_cast<unsigned>(found - alphabet);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            output.push_back(static_cast<char>((accumulator >> bits) & 0xff));
+        }
+    }
+    return output;
+}
+
 int main(const int argument_count, char** arguments) {
     if (argument_count == 4 && std::strcmp(arguments[1], "--text") == 0) {
-        const bool converted =
-            OpusModernDocxToTextFile(arguments[2], arguments[3]) != 0;
-        std::cout << "DOCX text import "
+        const bool odt = OpusModernPathIsOdt(arguments[2]) != 0;
+        const bool converted = (odt ?
+            OpusModernOdtToTextFile(arguments[2], arguments[3]) :
+            OpusModernDocxToTextFile(arguments[2], arguments[3])) != 0;
+        std::cout << (odt ? "ODT" : "DOCX") << " text import "
                   << (converted ? "passed" : "failed") << '\n';
         return converted ? 0 : 4;
     }
     if (argument_count == 3) {
-        const bool converted =
-            OpusModernDocxToRtfFile(arguments[1], arguments[2]) != 0;
-        std::cout << "DOCX import " << (converted ? "passed" : "failed")
+        const bool odt = OpusModernPathIsOdt(arguments[1]) != 0;
+        const bool converted = (odt ?
+            OpusModernOdtToRtfFile(arguments[1], arguments[2]) :
+            OpusModernDocxToRtfFile(arguments[1], arguments[2])) != 0;
+        std::cout << (odt ? "ODT" : "DOCX") << " import "
+                  << (converted ? "passed" : "failed")
                   << '\n';
         return converted ? 0 : 3;
     }
@@ -53,8 +83,13 @@ int main(const int argument_count, char** arguments) {
     const std::string base = seed;
     const std::string rtf = base + ".rtf";
     const std::string docx = base + ".docx";
+    const std::string odt = base + ".odt";
     const std::string roundtrip = base + ".roundtrip.rtf";
+    const std::string odt_roundtrip = base + ".odt-roundtrip.rtf";
     const std::string imported_text = base + ".unicode.txt";
+    const std::string odt_imported_text = base + ".odt-unicode.txt";
+    const std::string compressed_odt = base + ".compressed.odt";
+    const std::string compressed_rtf = base + ".compressed.rtf";
     const std::string oversized = base + ".oversized.rtf";
     const std::string preserved = base + ".preserved.pdf";
     char requested_pdf[32768]{};
@@ -97,6 +132,45 @@ int main(const int argument_count, char** arguments) {
             if (scalar == 12371) japanese_sidecar = true;
         }
     }
+    const bool odt_written = OpusModernRtfFileToOdt(
+        rtf.c_str(), odt.c_str()) != 0;
+    const bool odt_read = odt_written &&
+        OpusModernOdtToRtfFile(odt.c_str(), odt_roundtrip.c_str()) != 0;
+    const bool odt_unicode_imported = odt_written &&
+        OpusModernOdtToTextFile(odt.c_str(), odt_imported_text.c_str()) != 0 &&
+        OpusModernBindPendingDocxUnicode(43) != 0;
+    bool odt_cyrillic_sidecar = false;
+    bool odt_greek_sidecar = false;
+    bool odt_arabic_sidecar = false;
+    bool odt_japanese_sidecar = false;
+    if (odt_unicode_imported) {
+        const std::string imported_bytes = read_file(odt_imported_text);
+        for (long cp = 0; cp < static_cast<long>(imported_bytes.size()); ++cp) {
+            const unsigned int scalar = OpusUnicodeScalarAt(43, cp);
+            if (scalar == 1055) odt_cyrillic_sidecar = true;
+            if (scalar == 915) odt_greek_sidecar = true;
+            if (scalar == 1605) odt_arabic_sidecar = true;
+            if (scalar == 12371) odt_japanese_sidecar = true;
+        }
+    }
+    static constexpr const char* compressed_odt_base64 =
+        "UEsDBBQAAAAAADKSC11exjIMJwAAACcAAAAIAAAAbWltZXR5cGVhcHBsaWNhdGlvbi92bmQub2FzaXMub3BlbmRvY3VtZW50LnRl"
+        "eHRQSwMEFAAAAAgAMpILXfNZG7MaAQAAmwIAAAsAAABjb250ZW50LnhtbI1STW+EIBD9K4SerdtbQ4A9tPHaQ7c/ABEtiTKGwVb/"
+        "fUFc6x42WQ4wH+/Nm5nAz/PQkx/j0YIT9OX5RIlxGhrrOkG/LlXxSs+SQ9tabVgDehqMC4UGF+JLItkhy1lBJ+8YKLTInBoMsqAZ"
+        "jMZdWeyIZqtUjgQzh0fZCXvkYlj6h6VX8JHdwqPUGfuihTj4MKpg663Mvhk1BRhiQherBkqetdabZDuVF/QzeHAd3WKtGmy/CJrG"
+        "oldScorRxy58sAZJC7HRuPVfY7vvuKka+oamqIYevKBPVXWKh5aSlwfZ6N3tbkvU0Cy7k2QlXxc8yrc4qDeIpiE5hKNyJFupRnEz"
+        "jfx4v8QkBl7uYLnZ438fWaG8ES/v/C35B1BLAQIUABQAAAAAADKSC11exjIMJwAAACcAAAAIAAAAAAAAAAAAAACAAQAAAABtaW1l"
+        "dHlwZVBLAQIUABQAAAAIADKSC13zWRuzGgEAAJsCAAALAAAAAAAAAAAAAACAAU0AAABjb250ZW50LnhtbFBLBQYAAAAAAgACAG8A"
+        "AACQAQAAAAA=";
+    {
+        std::ofstream output(compressed_odt, std::ios::binary);
+        output << decode_base64(compressed_odt_base64);
+    }
+    const bool compressed_odt_read =
+        OpusModernOdtToRtfFile(compressed_odt.c_str(),
+                               compressed_rtf.c_str()) != 0;
+    const std::string compressed_result = compressed_odt_read ?
+        read_file(compressed_rtf) : "";
     const bool pdf_written = OpusModernRtfFileToPdf(rtf.c_str(), pdf.c_str()) != 0;
     {
         std::ofstream output(preserved, std::ios::binary);
@@ -132,6 +206,8 @@ int main(const int argument_count, char** arguments) {
         std::ifstream input(roundtrip, std::ios::binary);
         result.assign(std::istreambuf_iterator<char>(input), {});
     }
+    const std::string odt_result = odt_read ? read_file(odt_roundtrip) : "";
+    const std::string odt_package = odt_written ? read_file(odt) : "";
     std::string pdf_data;
     if (pdf_written) {
         std::ifstream input(pdf, std::ios::binary);
@@ -139,13 +215,38 @@ int main(const int argument_count, char** arguments) {
     }
     DeleteFileA(rtf.c_str());
     DeleteFileA(docx.c_str());
+    DeleteFileA(odt.c_str());
     DeleteFileA(roundtrip.c_str());
+    DeleteFileA(odt_roundtrip.c_str());
     DeleteFileA(imported_text.c_str());
+    DeleteFileA(odt_imported_text.c_str());
+    DeleteFileA(compressed_odt.c_str());
+    DeleteFileA(compressed_rtf.c_str());
     DeleteFileA(oversized.c_str());
     DeleteFileA(preserved.c_str());
     if (!keep_pdf) DeleteFileA(pdf.c_str());
     if (!written || !read || !unicode_imported || !cyrillic_sidecar ||
         !greek_sidecar || !arabic_sidecar || !japanese_sidecar ||
+        !odt_written || !odt_read || !odt_unicode_imported ||
+        !odt_cyrillic_sidecar || !odt_greek_sidecar ||
+        !odt_arabic_sidecar || !odt_japanese_sidecar ||
+        odt_result.find("Bold") == std::string::npos ||
+        odt_result.find("Second paragraph") == std::string::npos ||
+        odt_result.find("\\u1055") == std::string::npos ||
+        odt_result.find("\\u915") == std::string::npos ||
+        odt_result.find("\\u1605") == std::string::npos ||
+        odt_result.find("\\u12371") == std::string::npos ||
+        odt_result.find("\\b") == std::string::npos ||
+        odt_result.find("\\cf1") == std::string::npos ||
+        !odt_package.starts_with("PK") ||
+        odt_package.find("application/vnd.oasis.opendocument.text") ==
+            std::string::npos ||
+        odt_package.find("META-INF/manifest.xml") == std::string::npos ||
+        !compressed_odt_read ||
+        compressed_result.find("Compressed") == std::string::npos ||
+        compressed_result.find("ODT test") == std::string::npos ||
+        compressed_result.find("\\b") == std::string::npos ||
+        compressed_result.find("\\cf1") == std::string::npos ||
         result.find("Bold") == std::string::npos ||
         result.find("Second paragraph") == std::string::npos ||
         result.find("\\u1055") == std::string::npos ||
@@ -164,14 +265,18 @@ int main(const int argument_count, char** arguments) {
         pdf_data.find("xref") == std::string::npos ||
         pdf_data.find("%%EOF") == std::string::npos ||
         !oversized_rejected || !invalid_snapshot_rejected) {
-        std::cerr << "DOCX round trip failed: write=" << written
+        std::cerr << "modern format round trip failed: docxWrite=" << written
                   << " read=" << read << " pdf=" << pdf_written
+                  << " odtWrite=" << odt_written
+                  << " odtRead=" << odt_read
                   << " bytes=" << result.size()
                   << " oversizedRejected=" << oversized_rejected
                   << " invalidSnapshotRejected="
                   << invalid_snapshot_rejected << '\n';
         return 2;
     }
-    std::cout << "DOCX round trip passed (" << result.size() << " RTF bytes)\n";
+    std::cout << "DOCX/ODT round trips passed (" << result.size()
+              << " DOCX RTF bytes, " << odt_result.size()
+              << " ODT RTF bytes)\n";
     return 0;
 }
